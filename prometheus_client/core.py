@@ -301,6 +301,11 @@ class _LabelWrapper(object):
         with self._lock:
             del self._metrics[labelvalues]
 
+    def removeall(self):
+        rmlabelvalues = self._metrics.keys()
+        for labelvalues in rmlabelvalues:
+            self.remove(*labelvalues)
+
     def _samples(self):
         with self._lock:
             metrics = self._metrics.copy()
