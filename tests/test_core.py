@@ -308,8 +308,16 @@ class TestMetricWrapper(unittest.TestCase):
         self.assertRaises(ValueError, Counter, '', 'help', namespace='&')
         self.assertRaises(ValueError, Counter, '', 'help', subsystem='(')
         self.assertRaises(ValueError, Counter, 'c', '', labelnames=['^'])
+        self.assertRaises(ValueError, Counter, 'c', '', labelnames=['a:b'])
         self.assertRaises(ValueError, Counter, 'c', '', labelnames=['__reserved'])
         self.assertRaises(ValueError, Summary, 'c', '', labelnames=['quantile'])
+
+    def test_empty_labels_list(self):
+        h = Histogram('h', 'help', [], registry=self.registry)
+        self.assertEqual(0, self.registry.get_sample_value('h_sum'))
+
+    def test_wrapped_original_class(self):
+        self.assertEqual(Counter.__wrapped__, Counter('foo', 'bar').__class__)
 
 
 class TestMetricFamilies(unittest.TestCase):
@@ -389,6 +397,65 @@ class TestMetricFamilies(unittest.TestCase):
         self.assertRaises(ValueError, HistogramMetricFamily, 'h', 'help', buckets={}, labels=['a'])
         self.assertRaises(ValueError, HistogramMetricFamily, 'h', 'help', buckets={}, sum_value=1, labels=['a'])
         self.assertRaises(KeyError, HistogramMetricFamily, 'h', 'help', buckets={}, sum_value=1)
+
+
+class TestCollectorRegistry(unittest.TestCase):
+    def test_duplicate_metrics_raises(self):
+        registry = CollectorRegistry()
+        Counter('c', 'help', registry=registry)
+        self.assertRaises(ValueError, Counter, 'c', 'help', registry=registry)
+        self.assertRaises(ValueError, Gauge, 'c', 'help', registry=registry)
+
+        Gauge('g', 'help', registry=registry)
+        self.assertRaises(ValueError, Gauge, 'g', 'help', registry=registry)
+        self.assertRaises(ValueError, Counter, 'g', 'help', registry=registry)
+
+        Summary('s', 'help', registry=registry)
+        self.assertRaises(ValueError, Summary, 's', 'help', registry=registry)
+        # We don't currently expose quantiles, but let's prevent future
+        # clashes anyway.
+        self.assertRaises(ValueError, Gauge, 's', 'help', registry=registry)
+
+        Histogram('h', 'help', registry=registry)
+        self.assertRaises(ValueError, Histogram, 'h', 'help', registry=registry)
+        # Clashes aggaint various suffixes.
+        self.assertRaises(ValueError, Summary, 'h', 'help', registry=registry)
+        self.assertRaises(ValueError, Counter, 'h_count', 'help', registry=registry)
+        self.assertRaises(ValueError, Counter, 'h_sum', 'help', registry=registry)
+        self.assertRaises(ValueError, Counter, 'h_bucket', 'help', registry=registry)
+        # The name of the histogram itself isn't taken.
+        Counter('h', 'help', registry=registry)
+
+    def test_unregister_works(self):
+        registry = CollectorRegistry()
+        s = Summary('s', 'help', registry=registry)
+        self.assertRaises(ValueError, Counter, 's_count', 'help', registry=registry)
+        registry.unregister(s)
+        Counter('s_count', 'help', registry=registry)
+
+    def custom_collector(self, metric_family, registry):
+        class CustomCollector(object):
+            def collect(self):
+                return [metric_family]
+        registry.register(CustomCollector())
+
+    def test_autodescribe_disabled_by_default(self):
+        registry = CollectorRegistry()
+        self.custom_collector(CounterMetricFamily('c', 'help', value=1), registry)
+        self.custom_collector(CounterMetricFamily('c', 'help', value=1), registry)
+
+        registry = CollectorRegistry(auto_describe=True)
+        self.custom_collector(CounterMetricFamily('c', 'help', value=1), registry)
+        self.assertRaises(ValueError, self.custom_collector, CounterMetricFamily('c', 'help', value=1), registry)
+
+    def test_restricted_registry(self):
+        registry = CollectorRegistry()
+        Counter('c', 'help', registry=registry)
+        Summary('s', 'help', registry=registry).observe(7)
+
+        m = Metric('s', 'help', 'summary')
+        m.samples = [('s_sum', {}, 7)]
+        self.assertEquals([m], registry.restricted_registry(['s_sum']).collect())
 
 
 if __name__ == '__main__':

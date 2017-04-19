@@ -3,8 +3,12 @@
 from __future__ import unicode_literals
 
 import copy
+import json
 import math
+import mmap
+import os
 import re
+import struct
 import time
 import types
 
@@ -15,14 +19,16 @@ except ImportError:
     unicode = str
 
 from threading import Lock
+from timeit import default_timer
 
 from .decorator import decorate
 
 _METRIC_NAME_RE = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*$')
-_METRIC_LABEL_NAME_RE = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*$')
+_METRIC_LABEL_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 _RESERVED_METRIC_LABEL_NAME_RE = re.compile(r'^__.*$')
 _INF = float("inf")
 _MINUS_INF = float("-inf")
+_INITIAL_MMAP_SIZE = 1024*1024
 
 
 class CollectorRegistry(object):
@@ -32,28 +38,93 @@ class CollectorRegistry(object):
     Metric objects. The returned metrics should be consistent with the Prometheus
     exposition formats.
     '''
-    def __init__(self):
-        self._collectors = set()
+    def __init__(self, auto_describe=False):
+        self._collector_to_names = {}
+        self._names_to_collectors = {}
+        self._auto_describe = auto_describe
         self._lock = Lock()
 
     def register(self, collector):
         '''Add a collector to the registry.'''
         with self._lock:
-            self._collectors.add(collector)
+            names = self._get_names(collector)
+            for name in names:
+                if name in self._names_to_collectors:
+                    raise ValueError('Timeseries already present '
+                            'in CollectorRegistry: ' + name)
+            for name in names:
+                self._names_to_collectors[name] = collector
+            self._collector_to_names[collector] = names
 
     def unregister(self, collector):
         '''Remove a collector from the registry.'''
         with self._lock:
-            self._collectors.remove(collector)
+            for name in self._collector_to_names[collector]:
+                del self._names_to_collectors[name]
+            del self._collector_to_names[collector]
+
+    def _get_names(self, collector):
+        '''Get names of timeseries the collector produces.'''
+        desc_func = None
+        # If there's a describe function, use it.
+        try:
+            desc_func = collector.describe
+        except AttributeError:
+            pass
+        # Otherwise, if auto describe is enabled use the collect function.
+        if not desc_func and self._auto_describe:
+            desc_func = collector.collect
+
+        if not desc_func:
+            return []
+
+        result = []
+        type_suffixes = {
+            'summary': ['', '_sum', '_count'],
+            'histogram': ['_bucket', '_sum', '_count']
+        }
+        for metric in desc_func():
+            for suffix in type_suffixes.get(metric.type, ['']):
+                result.append(metric.name + suffix)
+        return result
 
     def collect(self):
         '''Yields metrics from the collectors in the registry.'''
         collectors = None
         with self._lock:
-            collectors = copy.copy(self._collectors)
+            collectors = copy.copy(self._collector_to_names)
         for collector in collectors:
             for metric in collector.collect():
                 yield metric
+
+    def restricted_registry(self, names):
+        '''Returns object that only collects some metrics.
+
+        Returns an object which upon collect() will return
+        only samples with the given names.
+
+        Intended usage is:
+            generate_latest(REGISTRY.restricted_registry(['a_timeseries']))
+
+        Experimental.'''
+        names = set(names)
+        collectors = set()
+        with self._lock:
+            for name in names:
+                if name in self._names_to_collectors:
+                    collectors.add(self._names_to_collectors[name])
+        metrics = []
+        for collector in collectors:
+            for metric in collector.collect():
+                samples = [s for s in metric.samples if s[0] in names]
+                if samples:
+                    m = Metric(metric.name, metric.documentation, metric.type)
+                    m.samples = samples
+                    metrics.append(m)
+        class RestrictedRegistry(object):
+            def collect(self):
+                return metrics
+        return RestrictedRegistry()
 
     def get_sample_value(self, name, labels=None):
         '''Returns the sample value, or None if not found.
@@ -69,7 +140,7 @@ class CollectorRegistry(object):
         return None
 
 
-REGISTRY = CollectorRegistry()
+REGISTRY = CollectorRegistry(auto_describe=True)
 '''The default registry.'''
 
 _METRIC_TYPES = ('counter', 'gauge', 'summary', 'histogram', 'untyped')
@@ -220,7 +291,9 @@ class HistogramMetricFamily(Metric):
 class _MutexValue(object):
     '''A float protected by a mutex.'''
 
-    def __init__(self, name, labelnames, labelvalues):
+    _multiprocess = False
+
+    def __init__(self, typ, metric_name, name, labelnames, labelvalues, **kwargs):
       self._value = 0.0
       self._lock = Lock()
 
@@ -236,7 +309,139 @@ class _MutexValue(object):
       with self._lock:
           return self._value
 
-_ValueClass = _MutexValue
+class _MmapedDict(object):
+    """A dict of doubles, backed by an mmapped file.
+
+    The file starts with a 4 byte int, indicating how much of it is used.
+    Then 4 bytes of padding.
+    There's then a number of entries, consisting of a 4 byte int which is the
+    size of the next field, a utf-8 encoded string key, padding to a 8 byte
+    alignment, and then a 8 byte float which is the value.
+    """
+    def __init__(self, filename):
+        self._lock = Lock()
+        self._f = open(filename, 'a+b')
+        if os.fstat(self._f.fileno()).st_size == 0:
+            self._f.truncate(_INITIAL_MMAP_SIZE)
+        self._capacity = os.fstat(self._f.fileno()).st_size
+        self._m = mmap.mmap(self._f.fileno(), self._capacity)
+
+        self._positions = {}
+        self._used = struct.unpack_from(b'i', self._m, 0)[0]
+        if self._used == 0:
+            self._used = 8
+            struct.pack_into(b'i', self._m, 0, self._used)
+        else:
+            for key, _, pos in self._read_all_values():
+                self._positions[key] = pos
+
+    def _init_value(self, key):
+        """Initialize a value. Lock must be held by caller."""
+        encoded = key.encode('utf-8')
+        # Pad to be 8-byte aligned.
+        padded = encoded + (b' ' * (8 - (len(encoded) + 4) % 8))
+        value = struct.pack('i{0}sd'.format(len(padded)).encode(), len(encoded), padded, 0.0)
+        while self._used + len(value) > self._capacity:
+            self._capacity *= 2
+            self._f.truncate(self._capacity)
+            self._m = mmap.mmap(self._f.fileno(), self._capacity)
+        self._m[self._used:self._used + len(value)] = value
+
+        # Update how much space we've used.
+        self._used += len(value)
+        struct.pack_into(b'i', self._m, 0, self._used)
+        self._positions[key] = self._used - 8
+
+    def _read_all_values(self):
+        """Yield (key, value, pos). No locking is performed."""
+        pos = 8
+        while pos < self._used:
+            encoded_len = struct.unpack_from(b'i', self._m, pos)[0]
+            pos += 4
+            encoded = struct.unpack_from('{0}s'.format(encoded_len).encode(), self._m, pos)[0]
+            padded_len = encoded_len + (8 - (encoded_len + 4) % 8)
+            pos += padded_len
+            value = struct.unpack_from(b'd', self._m, pos)[0]
+            yield encoded.decode('utf-8'), value, pos
+            pos += 8
+
+    def read_all_values(self):
+        """Yield (key, value, pos). No locking is performed."""
+        for k, v, _ in self._read_all_values():
+            yield k, v
+
+    def read_value(self, key):
+        with self._lock:
+            if key not in self._positions:
+                self._init_value(key)
+        pos = self._positions[key]
+        # We assume that reading from an 8 byte aligned value is atomic
+        return struct.unpack_from(b'd', self._m, pos)[0]
+
+    def write_value(self, key, value):
+        with self._lock:
+            if key not in self._positions:
+                self._init_value(key)
+        pos = self._positions[key]
+        # We assume that writing to an 8 byte aligned value is atomic
+        struct.pack_into(b'd', self._m, pos, value)
+
+    def close(self):
+        if self._f:
+            self._f.close()
+            self._f = None
+
+
+def _MultiProcessValue(__pid=os.getpid()):
+    pid = __pid
+    files = {}
+    files_lock = Lock()
+
+    class _MmapedValue(object):
+        '''A float protected by a mutex backed by a per-process mmaped file.'''
+
+        _multiprocess = True
+
+        def __init__(self, typ, metric_name, name, labelnames, labelvalues, multiprocess_mode='', **kwargs):
+            if typ == 'gauge':
+                file_prefix = typ + '_' +  multiprocess_mode
+            else:
+                file_prefix = typ
+            with files_lock:
+                if file_prefix not in files:
+                    filename = os.path.join(
+                            os.environ['prometheus_multiproc_dir'], '{0}_{1}.db'.format(file_prefix, pid))
+                    files[file_prefix] = _MmapedDict(filename)
+            self._file = files[file_prefix]
+            self._key = json.dumps((metric_name, name, labelnames, labelvalues))
+            self._value = self._file.read_value(self._key)
+            self._lock = Lock()
+
+        def inc(self, amount):
+            with self._lock:
+                self._value += amount
+                self._file.write_value(self._key, self._value)
+
+        def set(self, value):
+            with self._lock:
+                self._value = value
+                self._file.write_value(self._key, self._value)
+
+        def get(self):
+            with self._lock:
+                return self._value
+
+    return _MmapedValue
+
+
+# Should we enable multi-process mode?
+# This needs to be chosen before the first metric is constructed,
+# and as that may be in some arbitrary library the user/admin has
+# no control over we use an enviroment variable.
+if 'prometheus_multiproc_dir' in os.environ:
+    _ValueClass = _MultiProcessValue()
+else:
+    _ValueClass = _MutexValue
 
 
 class _LabelWrapper(object):
@@ -266,13 +471,13 @@ class _LabelWrapper(object):
             c.labels('get', '/').inc()
             c.labels('post', '/submit').inc()
 
-        Labels can also be provided as a dict:
+        Labels can also be provided as keyword arguments:
 
             from prometheus_client import Counter
 
             c = Counter('my_requests_total', 'HTTP Failures', ['method', 'endpoint'])
-            c.labels({'method': 'get', 'endpoint': '/'}).inc()
-            c.labels({'method': 'post', 'endpoint': '/submit'}).inc()
+            c.labels(method='get', endpoint='/').inc()
+            c.labels(method='post', endpoint='/submit').inc()
 
         See the best practices on [naming](http://prometheus.io/docs/practices/naming/)
         and [labels](http://prometheus.io/docs/practices/instrumentation/#use-labels).
@@ -336,10 +541,14 @@ def _MetricWrapper(cls):
                     raise ValueError('Reserved label metric name: ' + l)
             collector = _LabelWrapper(cls, name, labelnames, **kwargs)
         else:
-            collector = cls(name, labelnames, (), **kwargs)
+            collector = cls(name, (), (), **kwargs)
 
         if not _METRIC_NAME_RE.match(full_name):
             raise ValueError('Invalid metric name: ' + full_name)
+
+        def describe():
+            return [Metric(full_name, documentation, cls._type)]
+        collector.describe = describe
 
         def collect():
             metric = Metric(full_name, documentation, cls._type)
@@ -352,6 +561,7 @@ def _MetricWrapper(cls):
             registry.register(collector)
         return collector
 
+    init.__wrapped__ = cls
     return init
 
 
@@ -392,7 +602,7 @@ class Counter(object):
     _reserved_labelnames = []
 
     def __init__(self, name, labelnames, labelvalues):
-        self._value = _ValueClass(name, labelnames, labelvalues)
+        self._value = _ValueClass(self._type, name, name, labelnames, labelvalues)
 
     def inc(self, amount=1):
         '''Increment counter by the given amount.'''
@@ -454,8 +664,12 @@ class Gauge(object):
     _type = 'gauge'
     _reserved_labelnames = []
 
-    def __init__(self, name, labelnames, labelvalues):
-        self._value = _ValueClass(name, labelnames, labelvalues)
+    def __init__(self, name, labelnames, labelvalues, multiprocess_mode='all'):
+        if (_ValueClass._multiprocess
+                and multiprocess_mode not in ['min', 'max', 'livesum', 'liveall', 'all']):
+            raise ValueError('Invalid multiprocess mode: ' + multiprocess_mode)
+        self._value = _ValueClass(self._type, name, name, labelnames,
+                labelvalues, multiprocess_mode=multiprocess_mode)
 
     def inc(self, amount=1):
         '''Increment gauge by the given amount.'''
@@ -538,8 +752,8 @@ class Summary(object):
     _reserved_labelnames = ['quantile']
 
     def __init__(self, name, labelnames, labelvalues):
-        self._count = _ValueClass(name + '_count', labelnames, labelvalues)
-        self._sum = _ValueClass(name + '_sum', labelnames, labelvalues)
+        self._count = _ValueClass(self._type, name, name + '_count', labelnames, labelvalues)
+        self._sum = _ValueClass(self._type, name, name + '_sum', labelnames, labelvalues)
 
     def observe(self, amount):
         '''Observe the given amount.'''
@@ -612,7 +826,7 @@ class Histogram(object):
     _reserved_labelnames = ['histogram']
 
     def __init__(self, name, labelnames, labelvalues, buckets=(.005, .01, .025, .05, .075, .1, .25, .5, .75, 1.0, 2.5, 5.0, 7.5, 10.0, _INF)):
-        self._sum = _ValueClass(name + '_sum', labelnames, labelvalues)
+        self._sum = _ValueClass(self._type, name, name + '_sum', labelnames, labelvalues)
         buckets = [float(b) for b in buckets]
         if buckets != sorted(buckets):
             # This is probably an error on the part of the user,
@@ -626,7 +840,7 @@ class Histogram(object):
         self._buckets = []
         bucket_labelnames = labelnames + ('le',)
         for b in buckets:
-          self._buckets.append(_ValueClass(name + '_bucket', bucket_labelnames, labelvalues + (_floatToGoString(b),)))
+          self._buckets.append(_ValueClass(self._type, name, name + '_bucket', bucket_labelnames, labelvalues + (_floatToGoString(b),)))
 
     def observe(self, amount):
         '''Observe the given amount.'''
@@ -659,11 +873,11 @@ class _HistogramTimer(object):
         self._histogram = histogram
 
     def __enter__(self):
-        self._start = time.time()
+        self._start = default_timer()
 
     def __exit__(self, typ, value, traceback):
         # Time can go backwards.
-        self._histogram.observe(max(time.time() - self._start, 0))
+        self._histogram.observe(max(default_timer() - self._start, 0))
 
     def __call__(self, f):
         def wrapped(func, *args, **kwargs):
@@ -713,11 +927,11 @@ class _SummaryTimer(object):
         self._summary = summary
 
     def __enter__(self):
-        self._start = time.time()
+        self._start = default_timer()
 
     def __exit__(self, typ, value, traceback):
         # Time can go backwards.
-        self._summary.observe(max(time.time() - self._start, 0))
+        self._summary.observe(max(default_timer() - self._start, 0))
 
     def __call__(self, f):
         def wrapped(func, *args, **kwargs):
@@ -731,11 +945,11 @@ class _GaugeTimer(object):
         self._gauge = gauge
 
     def __enter__(self):
-        self._start = time.time()
+        self._start = default_timer()
 
     def __exit__(self, typ, value, traceback):
         # Time can go backwards.
-        self._gauge.set(max(time.time() - self._start, 0))
+        self._gauge.set(max(default_timer() - self._start, 0))
 
     def __call__(self, f):
         def wrapped(func, *args, **kwargs):

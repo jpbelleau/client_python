@@ -66,6 +66,21 @@ a_sum 2
         metric_family.add_sample("a", {}, 1)
         self.assertEqual([metric_family], list(families))
 
+    def test_untyped(self):
+        # https://github.com/prometheus/client_python/issues/79
+        families = text_string_to_metric_families("""# HELP redis_connected_clients Redis connected clients
+# TYPE redis_connected_clients untyped
+redis_connected_clients{instance="rough-snowflake-web",port="6380"} 10.0
+redis_connected_clients{instance="rough-snowflake-web",port="6381"} 12.0
+""")
+        m = Metric("redis_connected_clients", "Redis connected clients", "untyped")
+        m.samples = [
+            ("redis_connected_clients", {"instance": "rough-snowflake-web", "port": "6380"}, 10),
+            ("redis_connected_clients", {"instance": "rough-snowflake-web", "port": "6381"}, 12),
+        ]
+        self.assertEqual([m], list(families))
+
+
     def test_type_help_switched(self):
         families = text_string_to_metric_families("""# HELP a help
 # TYPE a counter
@@ -120,6 +135,26 @@ a\t\t{\t\tfoo\t\t=\t\t"baz"\t\t}\t\t2
         metric_family.add_metric(["baz"], 2)
         self.assertEqual([metric_family], list(families))
 
+    def test_commas(self):
+        families = text_string_to_metric_families("""# TYPE a counter
+# HELP a help
+a{foo="bar",} 1
+# TYPE b counter
+# HELP b help
+b{,} 2
+""")
+        a = CounterMetricFamily("a", "help", labels=["foo"])
+        a.add_metric(["bar"], 1)
+        b = CounterMetricFamily("b", "help", value=2)
+        self.assertEqual([a, b], list(families))
+
+    def test_empty_brackets(self):
+        families = text_string_to_metric_families("""# TYPE a counter
+# HELP a help
+a{} 1
+""")
+        self.assertEqual([CounterMetricFamily("a", "help", value=1)], list(families))
+
     def test_nan(self):
         families = text_string_to_metric_families("""a NaN
 """)
@@ -136,6 +171,19 @@ a{foo="b\\\\a\\z"} 2
         metric_family.add_metric(["b\"a\nr"], 1)
         metric_family.add_metric(["b\\a\\z"], 2)
         self.assertEqual([metric_family], list(families))
+
+    def test_timestamps_discarded(self):
+        families = text_string_to_metric_families("""# TYPE a counter
+# HELP a help
+a{foo="bar"} 1\t000
+# TYPE b counter
+# HELP b help
+b 2  1234567890
+""")
+        a = CounterMetricFamily("a", "help", labels=["foo"])
+        a.add_metric(["bar"], 1)
+        b = CounterMetricFamily("b", "help", value=2)
+        self.assertEqual([a, b], list(families))
 
     @unittest.skipIf(sys.version_info < (2, 7), "Test requires Python 2.7+.")
     def test_roundtrip(self):

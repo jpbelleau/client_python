@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name = "prometheus_client",
-    version = "0.0.14",
+    version = "0.0.19",
     author = "Brian Brazil",
     author_email = "brian.brazil@robustperception.io",
     description = ("Python client for the Prometheus monitoring system."),
@@ -12,7 +12,7 @@ setup(
     keywords = "prometheus monitoring instrumentation client",
     url = "https://github.com/prometheus/client_python",
     packages=['prometheus_client', 'prometheus_client.bridge', 'prometheus_client.twisted'],
-    extras_requires={
+    extras_require={
         'twisted': ['twisted'],
     },
     test_suite="tests",

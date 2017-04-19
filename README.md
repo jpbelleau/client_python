@@ -206,6 +206,13 @@ other processes, for example:
 ProcessCollector(namespace='mydaemon', pid=lambda: open('/var/run/daemon.pid').read())
 ```
 
+### Platform Collector
+
+The client also automatically exports some metadata about Python. If using Jython,
+metadata about the JVM in use is also included. This information is available as 
+labels on the `python_info` metric. The value of the metric is 1, since it is the 
+labels that carry information.
+
 ## Exporting
 
 There are several options for exporting metrics.
@@ -321,6 +328,24 @@ for more information.
 `instance_ip_grouping_key` returns a grouping key with the instance label set
 to the host's IP address.
 
+### Handlers for authentication
+
+If the push gateway you are connecting to is protected with HTTP Basic Auth,
+you can use a special handler to set the Authorization header.
+
+```python
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+from prometheus_client.exposition import basic_auth_handler
+
+def my_auth_handler(url, method, timeout, headers, data):
+    username = 'foobar'
+    password = 'secret123'
+    return basic_auth_handler(url, method, timeout, headers, data, username, password)
+registry = CollectorRegistry()
+g = Gauge('job_last_success_unixtime', 'Last time a batch job successfully finished', registry=registry)
+g.set_to_current_time()
+push_to_gateway('localhost:9091', job='batchA', registry=registry, handler=my_auth_handler)
+```
 
 ## Bridges
 
@@ -365,6 +390,86 @@ REGISTRY.register(CustomCollector())
 
 `SummaryMetricFamily` and `HistogramMetricFamily` work similarly.
 
+A collector may implement a `describe` method which returns metrics in the same
+format as `collect` (though you don't have to include the samples). This is
+used to predetermine the names of time series a `CollectorRegistry` exposes and
+thus to detect collisions and duplicate registrations.
+
+Usually custom collectors do not have to implement `describe`. If `describe` is
+not implemented and the CollectorRegistry was created with `auto_desribe=True`
+(which is the case for the default registry) then `collect` will be called at
+registration time instead of `describe`. If this could cause problems, either
+implement a proper `describe`, or if that's not practical have `describe`
+return an empty list.
+
+
+## Multiprocess Mode (Gunicorn)
+
+Prometheus client libaries presume a threaded model, where metrics are shared
+across workers. This doesn't work so well for languages such as Python where
+it's common to have processes rather than threads to handle large workloads.
+
+To handle this the client library can be put in multiprocess mode.
+This comes with a number of limitations:
+
+- Registries can not be used as normal, all instantiated metrics are exported
+- Custom collectors do not work (e.g. cpu and memory metrics)
+- The pushgateway cannot be used
+- Gauges cannot use the `pid` label
+- Gunicorn's `preload_app` feature and equivalents are not supported
+
+There's several steps to getting this working:
+
+**One**: Gunicorn deployment
+
+The `prometheus_multiproc_dir` environment variable must be set to a directory
+that the client library can use for metrics. This directory must be wiped
+between Gunicorn runs (before startup is recommended).
+
+Put the following in the config file:
+```python
+from prometheus_client import multiprocess
+
+def child_exit(server, worker):
+    multiprocess.mark_process_dead(worker.pid)
+```
+
+**Two**: Inside the application
+```python
+from prometheus_client import multiprocess
+from prometheus_client import generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST, Gauge
+
+# Example gauge.
+IN_PROGRESS = Gauge("inprogress_requests", "help", multiprocess_mode='livesum')
+
+
+# Expose metrics.
+@IN_PROGRESS.track_inprogress()
+def app(environ, start_response):
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    data = generate_latest(registry)
+    status = '200 OK'
+    response_headers = [
+        ('Content-type', CONTENT_TYPE_LATEST),
+        ('Content-Length', str(len(data)))
+    ]
+    start_response(status, response_headers)
+    return iter([data])
+```
+
+**Three**: Instrumentation
+
+Counters, Summarys and Histograms work as normal.
+
+Gauges have several modes they can run in, which can be selected with the
+`multiprocess_mode` parameter.
+
+- 'all': Default. Return a timeseries per process alive or dead.
+- 'liveall': Return a timeseries per process that is still alive.
+- 'livesum': Return a single timeseries that is the sum of the values of alive processes.
+- 'max': Return a single timeseries that is the maximum of the values of all processes, alive or dead.
+- 'min': Return a single timeseries that is the minimum of the values of all processes, alive or dead.
 
 ## Parser
 
